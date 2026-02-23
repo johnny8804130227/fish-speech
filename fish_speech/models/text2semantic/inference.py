@@ -1,5 +1,6 @@
 import os
 import queue
+import re
 import threading
 import time
 import traceback
@@ -390,6 +391,53 @@ class GenerateResponse:
     text: Optional[str] = None
 
 
+def _split_sentences(text: str) -> list[str]:
+    """Split text into sentences on punctuation for iterative generation."""
+    sentences = re.split(r"(?<=[。！？；;.!?\n])\s*", text)
+    return [s.strip() for s in sentences if s.strip()]
+
+
+def _build_iter_context(
+    use_prompt: bool,
+    prompt_text: list[str],
+    prompt_tokens: list[torch.Tensor],
+    context_pairs: list[tuple[str, torch.Tensor]],
+    sentence: str,
+    tokenizer,
+    num_codebooks: int,
+    max_length: int,
+    chunk_length: int,
+    device: Union[str, torch.device],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build encoded context for a sentence, trimming stale pairs if context is too long."""
+    pairs_to_use = list(context_pairs)
+    while True:
+        ctx = ContentSequence(modality="interleave")
+        if use_prompt:
+            for t, c in zip(prompt_text, prompt_tokens):
+                ctx.append([TextPart(text=t), VQPart(codes=c)], add_end=True, speaker=0)
+        for prev_text, prev_codes in pairs_to_use:
+            ctx.append(
+                [TextPart(text=prev_text), VQPart(codes=prev_codes)],
+                add_end=True,
+                speaker=0,
+            )
+        ctx.append([TextPart(text=sentence)], add_end=False, speaker=0)
+
+        encoded, audio_masks, audio_parts = ctx.encode_for_inference(
+            tokenizer, num_codebooks=num_codebooks
+        )
+        if encoded.size(1) <= max_length - chunk_length:
+            return encoded.to(device=device), audio_masks, audio_parts
+
+        if not pairs_to_use:
+            raise ValueError(
+                f"Sentence is too long even without prior context: {encoded.size(1)} > {max_length - chunk_length}"
+            )
+        pairs_to_use.pop(0)
+        logger.warning("Context too long, dropping oldest generated segment from context")
+
+
 def generate_long(
     *,
     model,
@@ -426,91 +474,136 @@ def generate_long(
 
     model_size = sum(p.numel() for p in model.parameters() if p.requires_grad)
     tokenizer = model.tokenizer
-    base_content_sequence = ContentSequence(modality="interleave")
-
     max_length = model.config.max_seq_len
-    if use_prompt:
-        for t, c in zip(prompt_text, prompt_tokens):
-            base_content_sequence.append(
-                [
-                    TextPart(text=t),
-                    VQPart(codes=c),
-                ],
-                add_end=True,
-                speaker=0,
-            )
-    base_content_sequence.append(
-        [
-            TextPart(text=text),
-        ],
-        add_end=False,
-        speaker=0,
-    )
 
-    encoded, audio_masks, audio_parts = base_content_sequence.encode_for_inference(
-        tokenizer, num_codebooks=model.config.num_codebooks
-    )
-    if encoded.size(1) > max_length - 2048:
-        raise ValueError(f"Prompt is too long: {encoded.size(1)} > {max_length - 2048}")
-
-    encoded = encoded.to(device=device)
     logger.info(f"Encoded text: {text}")
 
     for sample_idx in range(num_samples):
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
+        if iterative_prompt and chunk_length > 0:
+            # --- Iterative path: split into sentences and generate each one ---
+            sentences = _split_sentences(text) or [text]
+            context_pairs: list[tuple[str, torch.Tensor]] = []
 
-        global_encoded = []
-        seg_idx = 0
-        prompt_length = encoded.size(1)
+            for sentence in sentences:
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
 
-        t0 = time.perf_counter()
+                encoded, audio_masks, audio_parts = _build_iter_context(
+                    use_prompt=use_prompt,
+                    prompt_text=prompt_text,
+                    prompt_tokens=prompt_tokens,
+                    context_pairs=context_pairs,
+                    sentence=sentence,
+                    tokenizer=tokenizer,
+                    num_codebooks=model.config.num_codebooks,
+                    max_length=max_length,
+                    chunk_length=chunk_length,
+                    device=device,
+                )
 
-        y = generate(
-            model=model,
-            prompt=encoded,
-            max_new_tokens=max_new_tokens,
-            audio_masks=audio_masks,
-            audio_parts=audio_parts,
-            decode_one_token=decode_one_token,
-            temperature=temperature,
-            top_p=top_p,
-            repetition_penalty=repetition_penalty,
-        )
+                prompt_length = encoded.size(1)
+                t0 = time.perf_counter()
 
-        if sample_idx == 0 and seg_idx == 0 and compile:
-            logger.info(f"Compilation time: {time.perf_counter() - t0:.2f} seconds")
+                y = generate(
+                    model=model,
+                    prompt=encoded,
+                    max_new_tokens=chunk_length,
+                    audio_masks=audio_masks,
+                    audio_parts=audio_parts,
+                    decode_one_token=decode_one_token,
+                    temperature=temperature,
+                    top_p=top_p,
+                    repetition_penalty=repetition_penalty,
+                )
 
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
 
-        t = time.perf_counter() - t0
+                t = time.perf_counter() - t0
+                tokens_generated = y.size(1) - prompt_length
+                logger.info(
+                    f"[iter] '{sentence[:30]}' → {tokens_generated} tokens"
+                    f" in {t:.2f}s ({tokens_generated / t:.1f} tok/s)"
+                )
 
-        tokens_generated = y.size(1) - prompt_length
-        tokens_sec = tokens_generated / t
-        logger.info(
-            f"Generated {tokens_generated} tokens in {t:.02f} seconds, {tokens_sec:.02f} tokens/sec"
-        )
-        logger.info(f"Bandwidth achieved: {model_size * tokens_sec / 1e9:.02f} GB/s")
+                codes = y[1:, prompt_length:-1].clone()
+                assert (codes >= 0).all(), "Negative code found"
 
-        if torch.cuda.is_available():
-            logger.info(
-                f"GPU Memory used: {torch.cuda.max_memory_reserved() / 1e9:.02f} GB"
+                context_pairs.append((sentence, codes.cpu()))
+                yield GenerateResponse(action="sample", codes=codes, text=sentence)
+
+                del y, codes
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+        else:
+            # --- Non-iterative path: generate all tokens at once ---
+            base_content_sequence = ContentSequence(modality="interleave")
+            if use_prompt:
+                for t, c in zip(prompt_text, prompt_tokens):
+                    base_content_sequence.append(
+                        [TextPart(text=t), VQPart(codes=c)],
+                        add_end=True,
+                        speaker=0,
+                    )
+            base_content_sequence.append(
+                [TextPart(text=text)],
+                add_end=False,
+                speaker=0,
             )
 
-        # Put the generated tokens
-        codes = y[1:, prompt_length:-1].clone()
-        assert (codes >= 0).all(), f"Negative code found"
+            encoded, audio_masks, audio_parts = base_content_sequence.encode_for_inference(
+                tokenizer, num_codebooks=model.config.num_codebooks
+            )
+            if encoded.size(1) > max_length - 2048:
+                raise ValueError(
+                    f"Prompt is too long: {encoded.size(1)} > {max_length - 2048}"
+                )
 
-        decoded = y[:, prompt_length:].clone()
-        global_encoded.append(decoded.cpu())
-        assert (codes >= 0).all(), f"Negative code found: {codes}"
+            encoded = encoded.to(device=device)
+            prompt_length = encoded.size(1)
 
-        yield GenerateResponse(action="sample", codes=codes, text=text)
-        seg_idx += 1
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
 
-        # Force GPU memory cleanup
-        del y, decoded, codes
+            t0 = time.perf_counter()
+
+            y = generate(
+                model=model,
+                prompt=encoded,
+                max_new_tokens=max_new_tokens,
+                audio_masks=audio_masks,
+                audio_parts=audio_parts,
+                decode_one_token=decode_one_token,
+                temperature=temperature,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+            )
+
+            if sample_idx == 0 and compile:
+                logger.info(f"Compilation time: {time.perf_counter() - t0:.2f} seconds")
+
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+
+            t = time.perf_counter() - t0
+            tokens_generated = y.size(1) - prompt_length
+            tokens_sec = tokens_generated / t
+            logger.info(
+                f"Generated {tokens_generated} tokens in {t:.2f} seconds, {tokens_sec:.2f} tokens/sec"
+            )
+            logger.info(f"Bandwidth achieved: {model_size * tokens_sec / 1e9:.2f} GB/s")
+
+            if torch.cuda.is_available():
+                logger.info(
+                    f"GPU Memory used: {torch.cuda.max_memory_reserved() / 1e9:.2f} GB"
+                )
+
+            codes = y[1:, prompt_length:-1].clone()
+            assert (codes >= 0).all(), "Negative code found"
+
+            yield GenerateResponse(action="sample", codes=codes, text=text)
+            del y, codes
 
         yield GenerateResponse(action="next")
 

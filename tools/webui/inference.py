@@ -1,4 +1,5 @@
 import html
+import time
 from functools import partial
 from typing import Any, Callable
 
@@ -23,12 +24,15 @@ def inference_wrapper(
     """
     Wrapper for the inference function.
     Used in the Gradio interface.
+    When chunk_length > 0, yields intermediate audio segments for real-time playback.
     """
 
     if reference_audio:
         references = get_reference_audio(reference_audio, reference_text)
     else:
         references = []
+
+    use_streaming = chunk_length > 0
 
     req = ServeTTSRequest(
         text=text,
@@ -41,18 +45,67 @@ def inference_wrapper(
         temperature=temperature,
         seed=int(seed) if seed else None,
         use_memory_cache=use_memory_cache,
+        streaming=use_streaming,
     )
+
+    t0 = time.monotonic()
+    t_first = None
+    last_t = None
+    intervals = []
+    segment_count = 0
 
     for result in engine.inference(req):
         match result.code:
-            case "final":
-                return result.audio, None
-            case "error":
-                return None, build_html_error_message(i18n(result.error))
-            case _:
+            case "header":
                 pass
+            case "segment":
+                now = time.monotonic()
+                if t_first is None:
+                    t_first = now
+                if last_t is not None:
+                    intervals.append(now - last_t)
+                last_t = now
+                segment_count += 1
 
-    return None, i18n("No audio generated")
+                stats = _format_stats(t0, t_first, intervals, segment_count, done=False)
+                yield result.audio, None, stats
+            case "final":
+                stats = _format_stats(t0, t_first, intervals, segment_count, done=True)
+                if segment_count == 0:
+                    # non-streaming path: engine collected everything into "final"
+                    yield result.audio, None, stats
+                else:
+                    yield None, None, stats
+                return
+            case "error":
+                stats = _format_stats(t0, t_first, intervals, segment_count, done=True)
+                yield None, build_html_error_message(i18n(result.error)), stats
+                return
+
+    stats = _format_stats(t0, t_first, intervals, segment_count, done=True)
+    yield None, i18n("No audio generated"), stats
+
+
+def _format_stats(
+    t0: float,
+    t_first: float | None,
+    intervals: list[float],
+    segment_count: int,
+    done: bool,
+) -> str:
+    elapsed = time.monotonic() - t0
+    first = "n/a" if t_first is None else f"{t_first - t0:.2f}s"
+    avg = (
+        f"{sum(intervals) / len(intervals):.2f}s" if intervals else "n/a"
+    )
+    status = "done" if done else "streaming"
+    return (
+        f"Status: {status}\n"
+        f"Segments: {segment_count}\n"
+        f"First segment: {first}\n"
+        f"Avg segment interval: {avg}\n"
+        f"Elapsed: {elapsed:.2f}s"
+    )
 
 
 def get_reference_audio(reference_audio: str, reference_text: str) -> list:
@@ -71,7 +124,7 @@ def build_html_error_message(error: Any) -> str:
     error = error if isinstance(error, Exception) else Exception("Unknown error")
 
     return f"""
-    <div style="color: red; 
+    <div style="color: red;
     font-weight: bold;">
         {html.escape(str(error))}
     </div>

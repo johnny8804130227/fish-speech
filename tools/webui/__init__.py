@@ -123,6 +123,13 @@ def build_app(inference_fct: Callable, theme: str = "light") -> gr.Blocks:
                         type="numpy",
                         interactive=False,
                         visible=True,
+                        streaming=True,
+                        autoplay=True,
+                    )
+                with gr.Row():
+                    stats = gr.Markdown(
+                        label=i18n("Stats"),
+                        visible=True,
                     )
 
                 with gr.Row():
@@ -148,7 +155,7 @@ def build_app(inference_fct: Callable, theme: str = "light") -> gr.Blocks:
                 seed,
                 use_memory_cache,
             ],
-            [audio, error],
+            [audio, error, stats],
             concurrency_limit=1,
         )
 
