@@ -78,7 +78,7 @@ EXPOSE 7860
 ENV GRADIO_SERVER_NAME=0.0.0.0 \
     GRADIO_SERVER_PORT=7860
 
-CMD ["python", "-m", "tools.run_webui", \
+CMD ["python3", "-m", "tools.run_webui", \
     "--llama-checkpoint-path", "checkpoints/openaudio-s1-mini", \
     "--decoder-checkpoint-path", "checkpoints/openaudio-s1-mini/codec.pth", \
     "--decoder-config-name", "modded_dac_vq"]
