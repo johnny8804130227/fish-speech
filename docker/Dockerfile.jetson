@@ -10,7 +10,7 @@
 #       -p 7861:7860 \
 #       fish-speech-webui:jetson
 
-ARG PYTORCH_TAG=2.3-r36.4.0
+ARG PYTORCH_TAG=2.7-r36.4.0
 FROM dustynv/pytorch:${PYTORCH_TAG}
 
 ENV DEBIAN_FRONTEND=noninteractive \
