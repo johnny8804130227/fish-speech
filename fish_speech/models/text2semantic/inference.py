@@ -393,7 +393,7 @@ class GenerateResponse:
 
 def _split_sentences(text: str) -> list[str]:
     """Split text into sentences on punctuation for iterative generation."""
-    sentences = re.split(r"(?<=[。！？；;.!?\n])\s*", text)
+    sentences = re.split(r"(?<=[。！？；;.!?\n，,])\s*", text)
     return [s.strip() for s in sentences if s.strip()]
 
 
