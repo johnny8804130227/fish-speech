@@ -1,0 +1,80 @@
+# docker/Dockerfile.jetson
+# For NVIDIA Jetson Orin (JetPack 6.x / L4T R36.x)
+#
+# Build:
+#   docker build -f docker/Dockerfile.jetson -t fish-speech-webui:jetson .
+#
+# Run:
+#   docker run --runtime=nvidia \
+#       -v ./checkpoints:/app/checkpoints \
+#       -p 7861:7860 \
+#       fish-speech-webui:jetson
+
+ARG PYTORCH_TAG=2.3-r36.4.0
+FROM dustynv/pytorch:${PYTORCH_TAG}
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libsox-dev \
+    build-essential \
+    cmake \
+    libasound-dev \
+    portaudio19-dev \
+    libportaudio2 \
+    libportaudiocpp0 \
+    ffmpeg \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY . .
+
+# Install fish-speech deps (torch/torchaudio already in base image)
+RUN pip install --no-cache-dir \
+    "numpy<=1.26.4" \
+    "transformers>=4.45.2" \
+    "datasets==2.18.0" \
+    "lightning>=2.1.0" \
+    "hydra-core>=1.3.2" \
+    "tensorboard>=2.14.1" \
+    "natsort>=8.4.0" \
+    "einops>=0.7.0" \
+    "librosa>=0.10.1" \
+    "rich>=13.5.3" \
+    "gradio>5.0.0" \
+    "wandb>=0.15.11" \
+    "grpcio>=1.58.0" \
+    "kui>=1.6.0" \
+    "uvicorn>=0.30.0" \
+    "loguru>=0.6.0" \
+    "loralib>=0.1.2" \
+    "pyrootutils>=1.0.4" \
+    "resampy>=0.4.3" \
+    "einx[torch]==0.2.2" \
+    "zstandard>=0.22.0" \
+    "pydub" \
+    "pyaudio" \
+    "modelscope==1.17.1" \
+    "opencc-python-reimplemented==0.1.7" \
+    "silero-vad" \
+    "ormsgpack" \
+    "tiktoken>=0.8.0" \
+    "pydantic==2.9.2" \
+    "cachetools" \
+    "descript-audio-codec" \
+    "descript-audiotools" \
+    && pip install --no-cache-dir -e .
+
+EXPOSE 7860
+
+ENV GRADIO_SERVER_NAME=0.0.0.0 \
+    GRADIO_SERVER_PORT=7860
+
+CMD ["python", "-m", "tools.run_webui", \
+    "--llama-checkpoint-path", "checkpoints/openaudio-s1-mini", \
+    "--decoder-checkpoint-path", "checkpoints/openaudio-s1-mini/codec.pth", \
+    "--decoder-config-name", "modded_dac_vq"]
