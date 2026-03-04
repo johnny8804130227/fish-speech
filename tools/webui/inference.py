@@ -48,6 +48,8 @@ def inference_wrapper(
         streaming=use_streaming,
     )
 
+    yield None, None, "Status: starting..."
+
     t0 = time.monotonic()
     t_first = None
     last_t = None
