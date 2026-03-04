@@ -15,7 +15,9 @@ FROM dustynv/pytorch:${PYTORCH_TAG}
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    PIP_INDEX_URL=https://pypi.org/simple/ \
+    PIP_EXTRA_INDEX_URL=https://pypi.ngc.nvidia.com
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libsox-dev \
